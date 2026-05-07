@@ -5,12 +5,8 @@ import requests
 from vk_api import VkApi
 from typing import Tuple, Optional, Union
 
-# --- Отключение SSL глобально ---
-os.environ['CURL_CA_BUNDLE'] = ''
-os.environ['REQUESTS_CA_BUNDLE'] = ''
+# ---------- Отключение SSL ----------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Подмена SSL-контекста по умолчанию
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
@@ -18,41 +14,43 @@ except AttributeError:
 else:
     ssl._create_default_https_context = _create_unverified_https_context
 
-# Создаём сессию без проверки
 _custom_session = requests.Session()
 _custom_session.verify = False
 
-# Патчим класс VkApi: подменяем его внутреннюю сессию после инициализации
-_original_vk_init = VkApi.__init__
-
-def _patched_vk_init(self, *args, **kwargs):
-    _original_vk_init(self, *args, **kwargs)
-    if hasattr(self, 'http') and hasattr(self.http, '_session'):
-        self.http._session = _custom_session
-    # Также некоторые версии используют session
-    if hasattr(self, 'session'):
-        self.session = _custom_session
-
-VkApi.__init__ = _patched_vk_init
+def patch_vk_session(vk: VkApi):
+    if hasattr(vk, 'http') and hasattr(vk.http, '_session'):
+        vk.http._session = _custom_session
+    if hasattr(vk, 'session'):
+        vk.session = _custom_session
 
 def create_vk_session(phone: str, password: str = '') -> VkApi:
-    return VkApi(login=phone, password=password)
+    vk = VkApi(login=phone, password=password)
+    patch_vk_session(vk)
+    return vk
 
-# ---------- Вход по SMS-коду ----------
+# ---------- Авторизация по SMS-коду ----------
 def request_code(phone: str) -> Tuple[bool, Optional[VkApi], Optional[Union[str, dict]], Optional[bytes]]:
     vk = create_vk_session(phone, password='')
     try:
         vk.auth()
         return False, None, "Неожиданная успешная авторизация", None
     except Exception as e:
+        # Капча
         if hasattr(e, 'captcha_sid') and hasattr(e, 'captcha_img'):
             return False, vk, {"sid": e.captcha_sid, "img_url": e.captcha_img}, None
+        # Требуется код подтверждения
         if hasattr(e, 'need_validation') and e.need_validation:
             return True, vk, None, None
         err_str = str(e).lower()
         if "validation" in err_str or "code" in err_str:
             return True, vk, None, None
-        return False, None, str(e), None
+        # Flood control
+        if "flood" in err_str or "too many requests" in err_str:
+            return False, None, "⚠️ Слишком много запросов. Подождите 10-15 минут и попробуйте снова.", None
+        if "captcha" in err_str:
+            return False, vk, "Требуется капча, но данные не найдены. Попробуйте позже.", None
+        # Остальные ошибки
+        return False, None, f"❌ Ошибка VK: {e}", None
 
 def submit_code(vk: VkApi, code: str, captcha_sid: str = None, captcha_key: str = None) -> Tuple[bool, Optional[str], Optional[Union[str, dict]]]:
     try:
@@ -67,10 +65,12 @@ def submit_code(vk: VkApi, code: str, captcha_sid: str = None, captcha_key: str 
             return False, None, {"sid": e.captcha_sid, "img_url": e.captcha_img}
         err_str = str(e).lower()
         if "code" in err_str or "invalid" in err_str:
-            return False, None, "Неверный код подтверждения. Попробуйте ещё раз."
-        return False, None, str(e)
+            return False, None, "❌ Неверный код подтверждения. Попробуйте ещё раз."
+        if "flood" in err_str or "too many" in err_str:
+            return False, None, "⚠️ Слишком много попыток. Подождите 10 минут."
+        return False, None, f"❌ Ошибка: {e}"
 
-# ---------- Вход по паролю ----------
+# ---------- Авторизация по паролю ----------
 def login_with_password(phone: str, password: str, captcha_sid: str = None, captcha_key: str = None) -> Tuple[bool, Optional[str], Optional[str]]:
     try:
         vk = create_vk_session(phone, password)
@@ -83,4 +83,13 @@ def login_with_password(phone: str, password: str, captcha_sid: str = None, capt
     except Exception as e:
         if hasattr(e, 'captcha_sid') and hasattr(e, 'captcha_img'):
             return False, None, f"captcha_needed:{e.captcha_sid}:{e.captcha_img}"
-        return False, None, str(e)
+        err_str = str(e).lower()
+        if "password" in err_str or "login" in err_str or "invalid" in err_str:
+            if "password" in err_str:
+                return False, None, "❌ Неверный пароль. Попробуйте ещё раз."
+            return False, None, "❌ Неверный логин или пароль."
+        if "flood" in err_str or "too many" in err_str:
+            return False, None, "⚠️ Слишком много попыток входа. Подождите 15 минут."
+        if "captcha" in err_str:
+            return False, None, "Требуется капча, но данные не загрузились. Попробуйте позже."
+        return False, None, f"❌ Ошибка: {e}"
