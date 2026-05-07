@@ -1,5 +1,5 @@
 aiogram>=3.9.0
-vk-api==4.7.1
+vk-api>=11.0.0
 aiohttp>=3.9.0
 python-dotenv>=1.0.0
 urllib3>=2.0.0
